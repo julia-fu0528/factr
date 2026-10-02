@@ -11,6 +11,26 @@ import gravity_comp as gc
 
 
 class GravityTests(unittest.TestCase):
+    def test_failed_register_read_identifies_motor_and_register(self):
+        bus = object.__new__(gc.Bus)
+        bus.port = Mock()
+        bus.packet = Mock()
+        bus.packet.read1ByteTxRx.return_value = (0, -3001, 0)
+        bus.check = Mock(side_effect=RuntimeError('No status packet'))
+        with self.assertRaisesRegex(RuntimeError, 'ID 5, read register 98'):
+            bus.read(5, 98)
+
+    def test_failed_sync_read_reports_incomplete_buffers_without_stale_state(self):
+        bus = object.__new__(gc.Bus)
+        bus.reader = Mock()
+        bus.reader.txRxPacket.return_value = -3001
+        bus.reader.data_dict = {motor: [0]*10 for motor in gc.IDS}
+        bus.reader.data_dict[4] = []
+        bus.check = Mock(side_effect=RuntimeError('No status packet'))
+        with self.assertRaisesRegex(RuntimeError, r'incomplete response buffers for IDs \[4\]'):
+            bus.state()
+        bus.reader.getData.assert_not_called()
+
     def test_default_gravity_has_no_hidden_joint4_reduction(self):
         model, data = gc.model()
         for q in [gc.HOME, gc.HOME + np.array([.1, .2, -.1, .3, .1, -.2, .2])]:
@@ -193,19 +213,24 @@ class GravityTests(unittest.TestCase):
             np.testing.assert_array_equal(logged, bus.currents.call_args.args[0])
         bus.stop.assert_called_once()
 
-    def test_existing_log_refused_before_enabling(self):
+    def test_existing_log_overwritten_without_backup(self):
         bus = Mock()
         bus.state.return_value = (gc.SIGNS * gc.HOME, np.zeros(7))
+        bus.read.side_effect = lambda motor, reg: {6: 53, 11: 0, 98: 10}[reg]
         with tempfile.TemporaryDirectory() as directory:
             logfile = Path(directory) / 'run.csv'
-            logfile.write_text('preserve me')
-            args = SimpleNamespace(port='/dev/ttyUSB0', max_current_ma=350, log=logfile, gain=.85)
+            logfile.write_text('old sample\n' * 1000)
+            args = SimpleNamespace(port='/dev/ttyUSB0', max_current_ma=350,
+                                   log=logfile, gain=.85, duration=0)
             with patch.object(gc.Path, 'exists', return_value=True), \
                  patch.object(gc.Path, 'read_text', return_value='1'):
-                with self.assertRaises(FileExistsError):
-                    gc.run(bus, args, np.zeros(7), np.ones(7)*900)
-            self.assertEqual(logfile.read_text(), 'preserve me')
-        bus.write.assert_not_called()
+                gc.run(bus, args, np.zeros(7), np.ones(7)*900)
+            content = logfile.read_text()
+            self.assertTrue(content.startswith('time_s,loop_dt_s,'))
+            self.assertEqual(len(content.splitlines()), 1)
+            self.assertNotIn('old sample', content)
+            self.assertEqual(list(Path(directory).iterdir()), [logfile])
+        bus.stop.assert_called_once()
         bus.currents.assert_not_called()
 
 

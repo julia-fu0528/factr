@@ -338,11 +338,11 @@ def main():
                         while True:
                             # Confirm torque-off BEFORE waiting for terminal input.
                             bus.validate()
-                            response = input('Support arm, prepare catch. Type START to enable this one trial, or q to finish: ')
+                            response = input('Support arm, prepare catch. Press Enter to enable this one trial, or q to finish: ')
                             if response.strip().lower() == 'q':
                                 return
-                            if response.strip() != 'START':
-                                print('No motors enabled. Enter START or q.', flush=True)
+                            if response.strip():
+                                print('No motors enabled. Press Enter or type q to finish.', flush=True)
                                 continue
                             bus.validate()
                             raw, raw_v = bus.state()

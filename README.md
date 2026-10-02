@@ -304,6 +304,55 @@ compensation for every joint, including in teleop. Omit `--joint4-gain 0.3`.
 Restart a running controller to pick up the change. Encoder calibration and
 URDF parameters are unchanged; physical gravity accuracy is still unverified.
 
+### J4 breakaway measurement: first step
+
+Stop other arm controllers, support the arm in a comfortable pose away from
+joint limits, and run:
+
+```bash
+.venv/bin/python j4_breakaway.py --output outputs/diagnostics/j4_breakaway_01
+```
+
+Press **Enter** to enable HOLD and support the two-second startup ramp. Once
+`HOLD ready` appears:
+
+1. Type `+` and Enter. Unload your hand during the three-second settling period,
+   then keep a close catch **without touching or pushing** throughout the sweep.
+2. Wait for the result and automatic small return motion to finish, until
+   `HOLD ready` appears again. Type `-` and Enter for the opposite direction.
+3. Repeat `+`, then `-` once if comfortable. Support the arm before `q` and Enter
+   to disable torque. The session also ends automatically after 180 seconds.
+
+`+` increases the calibrated J4 angle; `-` decreases it. These are model
+directions, not labels for lifting/lowering. `x` and Enter cancels a measurement
+and returns to HOLD; `q`, Ctrl-C, or a fault disables torque immediately.
+
+Inertia shaping is off. All joints use the existing 0.85 gravity setting with
+PD pose support during HOLD. During a sweep, J4's holding current is frozen and
+stepped by 2.69 mA every 0.5 seconds until small sustained motion is detected;
+the other six joints retain pose support. The sweep stops at onset or its
+current/motion bounds, then brakes and slowly returns through the measured
+displacement. Total current stays capped at 350 mA (or the lower stored motor
+limit). The positive sweep can reach that total-current ceiling; the negative
+sweep retains its maximum 120 mA offset from J4's baseline. The CLI prints the
+bound for each trial. No threshold within those bounds is recorded as `censored`,
+with the limiting bound named, not a successful measurement.
+
+The output folder contains `samples.csv`, `trials.jsonl`, `report.json`, and
+`metadata.json`. Reusing the folder directly overwrites these files. Inspect
+the report without connecting to the arm with:
+
+```bash
+.venv/bin/python j4_breakaway.py --output outputs/diagnostics/j4_breakaway_01 --analyze-only
+```
+
+Pairs require successful opposite-direction trials starting within one degree
+on every joint. The measured thresholds include gravity bias, friction, and
+onset dynamics; they do not directly measure hand force or isolate a friction
+coefficient. This step changes neither calibration nor the assistance
+controller. The state machine has software tests; hardware behavior still
+requires an operator-supervised trial.
+
 ## Sources
 
 Model, reference image, motor conversion, and joint conventions come from
@@ -322,6 +371,9 @@ motor port or sending commands. It uses the previous capped motor command,
 model momentum and gravity/Coriolis terms to estimate unexplained effort.
 That residual includes friction and gravity/model error; it is not measured
 hand force. It never auto-zeroes a stationary residual.
+
+Recording with `gravity_comp.py run --log PATH` directly overwrites an existing
+CSV at that path, with no backup or timestamped copy.
 
 ```bash
 .venv/bin/python inertia_shadow.py outputs/diagnostics/gravity_sag_01.csv
@@ -353,3 +405,276 @@ approximately 0.15 times modeled gravity as residual even while stationary.
 Changing the assumed gravity scale demonstrates this sensitivity; it does not
 prove which model is physically correct or calibrate the arm. Never interpret
 the smaller residual by itself as validated hand-force sensing.
+
+## Experimental live inertia assistance
+
+The live adapter is `factr_inertia.py`. Unlike the offline commands below,
+**this command enables motor torque after you press Enter at the startup prompt**. Stop the existing
+controller, support the arm in the reference pose, and keep a catch ready.
+
+```bash
+.venv/bin/python factr_inertia.py --controller balanced --duration 120 \
+  --target-mass 0.15 0.15 0.15 \
+  --target-inertia 0.0002 0.0005 0.00002 \
+  --output outputs/diagnostics/balanced_drag_01
+```
+
+It starts gravity-only at 0.85 on all seven joints, damping 0.01, and total
+current caps of 350 mA (or the stored motor limit if lower). The existing
+encoder calibration and gravity model files are not modified. Return Delay 0,
+USB latency 1 ms, correct motor IDs/models, torque-off startup, and bus read
+speed are checked before enabling. Support the two-second startup ramp.
+
+Commands require Enter and are serviced without a blocking prompt once powered:
+
+| Command | Behavior |
+|---|---|
+| `a` | Toggle assistance ON/OFF after observer warmup; no three-second timer. Every toggle prints the new state. |
+| `q` / Ctrl-C | Disable all arm torque and exit. Support the arm first. |
+
+Keep holding the handle while testing. Use small comfortable movements; do not
+force J4 through its resistance to obtain a smooth trace.
+
+**Balanced drag is now the CLI default.** It implements B601-style target
+Cartesian inertia with a seven-joint completion, rather than a uniform
+lightening factor. `--target-mass MX MY MZ` specifies translational masses in kg;
+`--target-inertia IX IY IZ` specifies rotational inertias in kg m². Axes are
+the URDF `link_7` local x/y/z axes, not world axes. The default modeled handle
+point is the `link_7` origin. Set `--handle-offset X Y Z` in meters, expressed
+in those same axes, if the grip point differs; its physical offset has not
+been measured. The shifted Jacobian includes the angular-velocity contribution
+to linear velocity at that point.
+
+The provisional defaults are masses `[0.15, 0.15, 0.15]` and rotational inertias
+`[0.0002, 0.0005, 0.00002]`, chosen on the scale of this 0.67 kg link-only URDF,
+not copied from B601's much heavier model. They are targets, not measured hand
+inertias or a guarantee of achieved feel. At the reference pose, the natural
+operational inertia diagonal is approximately `[0.297, 0.111, 0.129]` kg and
+`[0.000256, 0.001026, 0.0000125]` kg m²; off-diagonal coupling also matters.
+The controller can assist directions heavier than the target and resist
+directions lighter than it. `--kappa 0.5` caps positive task-mode gains;
+`--resist 0.25` caps negative gains. Live ranges are 0..1 and 0..0.5,
+respectively, as experimental engineering limits, not proven stability bounds.
+These are task eigenmode gains, not per-joint gains or the old `--factor`.
+
+The extra internal degree of freedom is handled explicitly. In inertia-whitened
+coordinates, let `A = J M^(-1/2)`, let `Q` span the six task directions, and let
+`N = I - Q Qᵀ` project onto the internal direction. With `B = A Q`, the full
+target is
+
+```text
+H_d = Q (Bᵀ Lambda_d B) Qᵀ + N
+M_d = M^(1/2) H_d M^(1/2)
+S_task = clip_eigenvalues((Bᵀ Lambda_d B)^(-1) - I, -resist, kappa)
+tau_shape = M^(1/2) Q S_task Qᵀ M^(-1/2) residual_used
+```
+
+Unlike `Jᵀ Lambda_d J` alone, this target is full rank for seven joints. The
+internal direction keeps its natural modeled inertia with zero shaping gain:
+there is no added posture spring or automatic elbow positioning. At deficient
+task rank, shaping goes to zero. Geometry screening scales translation by a
+0.2 m characteristic length and fades shaping as the minimum/maximum Jacobian
+singular-value ratio falls from 0.04 to 0.02. The observer's internal torque
+component is removed before applying a one-current-step numerical deadband;
+this deadband is not a friction calibration or hand-force identification.
+
+Balanced output is signed: resisting torque and torque on currently stationary
+coupled joints are allowed. The old per-joint velocity-direction gate and
+80 ms dwell do not apply. A two-second activation ramp starts on enabling
+and restarts after a geometry gate, but does not restart at each reversal.
+Torque caps, slew bounds, speed fade, current headroom, and positive-power
+limits use one common scale for the entire torque vector. This preserves the
+task/internal separation before current quantization. Quantization perturbs
+that separation; `nullspace_output_nm_*` logs the resulting component. No
+friction compensation, learned static bias, or breakaway feed-forward is
+silently imported from B601. The modeled inertia excludes identified motor
+rotor/gear inertia. The target law and software bounds do not establish
+physical stability or eliminate the previously observed J4 resistance.
+
+`--torque-rise-rate` controls the additional torque magnitude growth bound
+(default 0.04 Nm/s, configurable above zero through 0.4). This differs from
+the two-second activation ramp: it can restrict output continuously as the
+proposed torque changes. Startup and metadata report the selected value.
+Larger values allow faster torque changes while preserving the torque, current,
+and instantaneous power caps; they have not been validated as hardware-safe
+settings. To compare the evaluated 0.16 Nm/s setting while keeping all targets
+fixed and saving a separate recording:
+
+```bash
+.venv/bin/python factr_inertia.py --controller balanced --duration 120 \
+  --torque-rise-rate 0.16 --output outputs/diagnostics/balanced_drag_rate016
+```
+
+The offline `balanced_replay.py` accepts the same option. Without an override it
+uses the recording's rate, or 0.04 for older recordings without that metadata.
+
+To bypass the experimental **additional torque, positive-power, and torque-rise
+caps**, balanced mode supports an explicit `--assist-limits current-only`
+profile. It keeps the total-current envelope (350 mA or the motor's lower stored
+limit), current quantization, two-second activation ramp, task eigenvalue limits
+(`--kappa`/`--resist`), singularity/speed gates, and fault shutdowns. It does not
+make the controller unbounded, remove target-gain clipping, or add friction
+compensation. The default remains `--assist-limits bounded`.
+
+```bash
+.venv/bin/python factr_inertia.py --controller balanced \
+  --assist-limits current-only --duration 120 \
+  --output outputs/diagnostics/balanced_current_only
+```
+
+This changes the possible motor output, not just the logging. No physical
+stability validation has been performed for this profile. Startup names the
+disabled limits; metadata records the profile and sets the three inactive cap
+values to `null`. Bypassed trace stages pass through their input unchanged.
+`--torque-rise-rate` has no effect with this profile. The same profile option
+is available in `balanced_replay.py` for fixed-recording comparisons without
+motor access.
+
+The earlier controller is retained for comparison:
+
+```bash
+.venv/bin/python factr_inertia.py --controller uniform --factor 1.25 --duration 120
+```
+
+`--factor` is rejected in balanced mode to avoid silently ignoring old commands.
+For an offline comparison on an existing recording (no hardware access):
+
+```bash
+.venv/bin/python balanced_replay.py outputs/diagnostics/inertia_live_01 \
+  --output outputs/diagnostics/balanced_replay_01
+```
+
+Replay holds recorded motion, observer residuals, baseline commands, and operator
+enable transitions fixed. It verifies command bounds and reports per-joint
+output, task gains, and internal torque leakage; it is not a closed-loop
+prediction of new arm motion. The same target/handle-offset CLI options apply.
+
+Assistance stays enabled until toggled off, a protection disables it, or the
+session ends. Live assistance has no cumulative energy cutoff. Added positive
+work is logged for analysis; it does not disable assistance. Each periodic
+status line reports `ASSISTANCE ON` or `ASSISTANCE OFF`, along with the output
+reason and extra current. ON means enabled, not necessarily nonzero output. Timing or
+state faults in the assistance limiter lock it off for the rest of the session
+and retain gravity compensation. The loop targets 250 Hz; measured windows
+below 200 Hz also lock assistance off. Hardware faults, communication failure,
+nonfinite states, joint-limit approach, speed over the hard cutoff (default 4 rad/s, matching `gravity_comp.py`), or stalls over
+100 ms exit with torque-off cleanup. A 200 ms motor watchdog is configured.
+These are experimental software precautions, not a stability guarantee.
+
+Live assistance begins fading at **2 rad/s** and switches assistance OFF at
+**3 rad/s**, retaining gravity compensation. After slowing down, another explicit
+`a` enables assistance again. This is separate
+from the **4 rad/s** hard torque-off cutoff, which applies in either mode.
+These are local engineering settings, not manufacturer ratings or validated
+stability boundaries. Configure them with `--assist-fade-speed`,
+`--assist-max-speed`, and `--max-joint-speed`; require
+`0.035 < fade < assist cutoff <= hard cutoff <= 4` (rad/s). Startup prints the
+values and metadata records them. The total-current envelope remains active in
+both profiles; additional torque and instantaneous power caps apply in `bounded` mode.
+
+
+The session ends automatically after the selected duration and disables torque;
+it prints a warning ten seconds before timeout. Default output is
+`outputs/diagnostics/inertia_live_01`: `metadata.json`, `samples.csv`, and
+`report.json` are directly overwritten on a new session. Logs include actual
+combined commands, baseline commands, assistance, current telemetry, reason
+codes, and cumulative `sampled_assist_work_j` from successfully sent assistance.
+Schema version 4 retains the replacement of the old `energy_remaining_j` CSV column with this
+work counter; metadata records `energy_budget_enabled: false` and
+`energy_budget_j: null`. The observer uses the previous
+successfully sent combined command, including assistance. Its gravity scale is
+an explicit 0.85 model assumption, not a physical calibration.
+
+Every live sample also records `candidate_assist_nm_1`–`7` before the limiter,
+then mode-specific gates, ramp and speed-fade factors,
+and torque after each stage: torque cap, motion ramp, speed fade, slew limit,
+direction gate, current headroom, power limit, and current quantization.
+The historical `power_energy_effort_nm` column name is retained; live runs now
+apply only the instantaneous power limit at that stage.
+The `*_magnitude_nm` columns are unsigned; `*_effort_nm` columns use model joint
+signs. For balanced mode, `motion_ramp` is the global activation ramp,
+`direction_effort_nm` is the signed output with no direction gate, and the
+per-joint moving/direction/dwell fields are not applicable (`NaN`).
+`raw_task_gain` and `clipped_task_gain` entries 1–6 are task eigenmodes, not
+joint indices; entry 7 is the zero internal gain. `residual_used_nm`,
+`nullspace_input_nm`, `nullspace_output_nm`, rank, null dimension, and geometry
+fade are also logged. `negative_power_w` records the nonpositive power of
+resisting outputs. `NaN` otherwise means the stage was bypassed by an earlier gate, identified by
+`reason`; it does not mean the motor was sent an invalid command. Warmup,
+geometry validity, Jacobian rank, minimum joint-limit margin, and baseline
+saturation are recorded separately. Invalid geometry zeros the candidate.
+`assist_nm_1`–`7` remain the final sent extra torque, including any late fault
+override after limiter evaluation. Existing recordings cannot recover
+these intermediate values.
+
+Software tests cover startup failure cleanup, explicit ON/OFF toggling, persistence beyond three seconds,
+gravity-only fallback, hard fault shutdown, current bounds, and observer command
+alignment, handle-offset finite differences, signed balanced output, full-rank
+target construction, and natural internal inertia. The balanced controller has
+not yet been validated on the physical arm.
+
+## Bounded inertia-assistance development
+
+`inertia_bounded.py` adds a seven-joint assistance limiter plus offline replay
+and synthetic closed-loop tests. The offline tool has no hardware launch mode (use the separate experimental
+`factr_inertia.py` adapter above for hardware). It does
+not open a serial port or modify calibration, gains, or motor registers.
+
+Run the software validation:
+
+```bash
+.venv/bin/python inertia_bounded.py validate
+```
+
+Replay an existing recording through the proposed observer and limiter:
+
+```bash
+.venv/bin/python inertia_bounded.py replay \
+  outputs/diagnostics/inertia_baseline_02.csv \
+  --output outputs/diagnostics/inertia_bounded_02
+```
+
+Outputs are directly overwritten within the selected output directory. The
+validation command writes twelve runs (six synthetic conditions, assistance
+off/on). The replay writes `bounded.csv`, `bounded_report.json`, and the
+unbounded proposal in its `unbounded` subdirectory. Log replay preserves the
+recorded motion; it cannot predict what the arm would do with added torque.
+Synthetic tests feed the baseline plus assistance back into the observer, but
+use independent joint inertias/friction and are not an identified FACTR model.
+
+The controller requires explicit operator enable. A joint receives no assist
+while stationary, during direction changes or during an 80 ms motion dwell.
+Assistance ramps in over 250 ms and only adds effort in the direction of motion.
+The experimental maximum added efforts (Nm) are
+`[0.01, 0.02, 0.01, 0.02, 0.005, 0.005, 0.003]`; rise rate is 0.04 Nm/s.
+Combined sampled positive power is capped at 0.01 W. The original offline replay
+and synthetic fixtures retain a 0.02 J cumulative work budget; the live runner
+explicitly disables that budget and continues logging cumulative work. It allocates only
+current headroom left by the gravity baseline, rounding added current toward
+zero. These are trial software limits, not validated physical ratings or a
+continuous-time passivity guarantee.
+
+The original offline synthetic fixture retains its deliberately low speed
+settings: motion above 0.20 rad/s reduces assistance; any joint reaching 0.35 rad/s,
+invalid state, or an update gap over 10 ms latches assistance off until a new
+controller is explicitly created. Geometry/observer gates and operator disable
+also remove assistance. The ideal full-matrix proposal retains natural modeled
+nullspace inertia, but per-joint motion gates/limits alter that exact property.
+This is bounded assistance research, not a claim of exact Cartesian inertia.
+The live adapter uses the independently configurable speed settings described
+above; the offline fixture defaults are not the live hardware cutoffs.
+
+The current log has approximately 23–26 ms once-per-second gaps. Exact replay
+therefore disables assistance at the first gap, before reaching motion; this
+is an expected rejection, not a successful hardware-assistance result.
+The gravity controller's status reads have now been staggered (one register
+every 30 ms rather than 21 together), covering each register approximately every
+0.63 seconds. Hardware error, watchdog and temperature checks remain; their
+new timing has unit coverage but has not been measured on hardware yet.
+
+Sticking means no joint motion despite an applied load. Breakaway/release means
+motion begins; this is not the operator releasing the handle. Static friction,
+kinetic friction and inertia have different effects. This controller deliberately
+cannot help initiate motion against static friction without an observable intent
+signal. Do not increase observer gain to manufacture one. The recorded residual
+also contains gravity/model error and cannot be treated as measured hand torque.

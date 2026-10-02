@@ -91,13 +91,19 @@ class Bus:
     def read(self, motor, address, size=1):
         value, result, error = getattr(self.packet, f"read{size}ByteTxRx")(
             self.port, motor, address)
-        self.check(result, error)
+        try:
+            self.check(result, error)
+        except RuntimeError as exc:
+            raise RuntimeError(f'ID {motor}, read register {address} ({size} bytes): {exc}') from exc
         return value
 
     def write(self, motor, address, value, size=1):
         result, error = getattr(self.packet, f"write{size}ByteTxRx")(
             self.port, motor, address, value)
-        self.check(result, error)
+        try:
+            self.check(result, error)
+        except RuntimeError as exc:
+            raise RuntimeError(f'ID {motor}, write register {address} ({size} bytes): {exc}') from exc
 
     def inspect(self):
         found = []
@@ -130,7 +136,17 @@ class Bus:
         return np.array(limits)
 
     def state(self):
-        self.check(self.reader.txRxPacket())
+        result = self.reader.txRxPacket()
+        try:
+            self.check(result)
+        except RuntimeError as exc:
+            # The SDK stops at the first failed read. Later buffers can contain
+            # old data, so report incomplete buffers rather than claiming a
+            # complete list of nonresponding motors. No stale data is returned.
+            buffers = getattr(self.reader, 'data_dict', {})
+            incomplete = [motor for motor, payload in buffers.items() if len(payload) != 10]
+            raise RuntimeError(f'State sync read registers 126–135; incomplete response buffers '
+                               f'for IDs {incomplete}: {exc}') from exc
         q, v = [], []
         for motor in IDS:
             if not self.reader.isAvailable(motor, 128, 8):
@@ -145,7 +161,10 @@ class Bus:
             value = int(value) & 0xffff
             if not writer.addParam(motor, [value & 255, value >> 8]):
                 raise RuntimeError(f"Cannot add current for ID {motor}")
-        self.check(writer.txPacket())
+        try:
+            self.check(writer.txPacket())
+        except RuntimeError as exc:
+            raise RuntimeError(f'Goal-current sync write: {exc}') from exc
 
     def present_current_ma(self):
         """Electrical telemetry from the last state read, not measured joint torque."""
@@ -189,6 +208,28 @@ def corrected_gravity(raw_gravity):
     return GRAVITY_MODEL_SCALE * np.asarray(raw_gravity)
 
 
+class StaggeredStatus:
+    """One register read per poll instead of a 21-read burst each second."""
+    def __init__(self, start):
+        self.last = start
+        self.index = 0
+        self.registers = [(motor, register) for motor in IDS for register in (70, 98, 146)]
+
+    def poll(self, bus, now):
+        if now-self.last < .03:
+            return
+        motor, register = self.registers[self.index]
+        value = bus.read(motor, register)
+        self.last = now
+        self.index = (self.index+1) % len(self.registers)
+        if register == 70 and value:
+            raise RuntimeError(f'Motor {motor}: hardware fault')
+        if register == 98 and value != 10:
+            raise RuntimeError(f'Motor {motor}: watchdog fault')
+        if register == 146 and value >= 65:
+            raise RuntimeError(f'Motor {motor}: temperature >=65 C')
+
+
 def run(bus, args, offsets, hardware_limits, on_state=None):
     gains = gravity_gains(args)
     m, data = model()
@@ -207,8 +248,8 @@ def run(bus, args, offsets, hardware_limits, on_state=None):
         if log_path is not None:
             log_path = Path(log_path)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            # Refuse overwrites before enabling any motor.
-            log_stream = log_path.open('x', newline='')
+            # Start a fresh log at the requested path before enabling motors.
+            log_stream = log_path.open('w', newline='')
             writer = csv.writer(log_stream)
             columns = ['time_s', 'loop_dt_s', 'read_duration_s', 'gain', 'damping']
             for name in ('q_rad', 'dq_rad_s', 'model_gravity_nm', 'requested_torque_nm',
@@ -232,6 +273,7 @@ def run(bus, args, offsets, hardware_limits, on_state=None):
             if bus.read(motor, 98) != 10:
                 raise RuntimeError(f"ID {motor}: watchdog verification failed")
         start = previous = last_status = time.monotonic()
+        health = StaggeredStatus(start)
         print("Gravity compensation active. Support arm before Ctrl-C; torque will turn off.")
         print('Gravity gains for joints 1–7:', gains, flush=True)
         print('Gravity model correction:', GRAVITY_MODEL_SCALE, flush=True)
@@ -263,12 +305,8 @@ def run(bus, args, offsets, hardware_limits, on_state=None):
                 log_stream.flush()
             if on_state is not None:
                 on_state(q)
+            health.poll(bus, tick)
             if tick - last_status > 1:
-                for motor in IDS:
-                    if bus.read(motor, 70) or bus.read(motor, 98) != 10:
-                        raise RuntimeError(f"Motor {motor}: hardware/watchdog fault")
-                    if bus.read(motor, 146) >= 65:
-                        raise RuntimeError(f"Motor {motor}: temperature >=65 C")
                 print(f"q={np.round(q, 2)} tau={np.round(torque, 3)}", flush=True)
                 last_status = tick
             time.sleep(max(0, 1 / args.hz - (time.monotonic() - tick)))
@@ -291,7 +329,7 @@ def main():
     parser.add_argument('--max-current-ma', type=float, default=350)
     parser.add_argument('--hz', type=float, default=200)
     parser.add_argument('--duration', type=float, default=30)
-    parser.add_argument('--log', type=Path, help='Run only: save diagnostic CSV to a new file; never overwrite')
+    parser.add_argument('--log', type=Path, help='Run only: save diagnostic CSV; overwrite an existing file directly')
     args = parser.parse_args()
     try:
         gains = gravity_gains(args)

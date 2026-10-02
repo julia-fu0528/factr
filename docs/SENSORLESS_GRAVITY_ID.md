@@ -15,7 +15,7 @@ FACTR in a comfortable pose away from mechanical stops and cable tension.
 .venv/bin/python identify_gravity.py --output outputs/diagnostics/hold_capture_01
 ```
 
-Type `START` when ready. Support the arm during the two-second current ramp.
+Press Enter when ready. Support the arm during the two-second current ramp.
 When HOLD appears it maintains the captured pose with bounded current/PD control.
 All seven joints receive pose support and oscillate together during capture, as
 in B601. Optional `--joint 4` restricts motion to J4; this is a FACTR extension.

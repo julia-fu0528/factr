@@ -414,7 +414,7 @@ def main():
         }, indent=2))
         print('Secure base. Keep a close unloaded catch ready. Faults disable torque. '
               'Support arm for startup and release; do not touch moving links during capture.', flush=True)
-        if input('Type START to enable HOLD, or anything else to cancel: ').strip().upper() != 'START':
+        if input('Press Enter to enable HOLD, or type anything to cancel: ').strip():
             return
         bus.validate()
         caps = capture_current_caps(limits, args.joint4_max_current_ma)
